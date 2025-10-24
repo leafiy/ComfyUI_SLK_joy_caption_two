@@ -5,6 +5,7 @@ import numpy as np
 from torch import nn
 from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast, \
     AutoModelForCausalLM
+from peft import PeftConfig, PeftModel
 from pathlib import Path
 import torch
 import torch.amp.autocast_mode
@@ -86,19 +87,35 @@ class ImageAdapter(nn.Module):
         # Other tokens (<|image_start|>, <|image_end|>, <|eot_id|>)
         self.other_tokens = nn.Embedding(3, output_features)
         self.other_tokens.weight.data.normal_(mean=0.0, std=0.02)   # Matches HF's implementation of llama3
-    def forward(self, vision_outputs: torch.Tensor):
-        if self.deep_extract:
-            x = torch.concat((
-				vision_outputs[-2],
-				vision_outputs[3],
-				vision_outputs[7],
-				vision_outputs[13],
-				vision_outputs[20],
-			), dim=-1)
-            assert len(x.shape) == 3, f"Expected 3, got {len(x.shape)}"  # batch, tokens, features
-            assert x.shape[-1] == vision_outputs[-2].shape[-1] * 5, f"Expected {vision_outputs[-2].shape[-1] * 5}, got {x.shape[-1]}"
+    def forward(self, vision_outputs):
+        """
+        Accepts either the raw tuple of hidden states, the model output containing them,
+        or a single tensor (falls back to the last hidden state).
+        """
+        if isinstance(vision_outputs, (list, tuple)):
+            hidden_states = tuple(vision_outputs)
+        elif hasattr(vision_outputs, "hidden_states") and vision_outputs.hidden_states is not None:
+            hidden_states = tuple(vision_outputs.hidden_states)
+        elif hasattr(vision_outputs, "last_hidden_state") and vision_outputs.last_hidden_state is not None:
+            hidden_states = (vision_outputs.last_hidden_state,)
         else:
-            x = vision_outputs[-2]
+            raise ValueError("Vision model did not return hidden states needed by ImageAdapter.")
+
+        hidden_states = tuple(state for state in hidden_states if state is not None)
+        if len(hidden_states) == 0:
+            raise ValueError("Unable to obtain non-empty vision hidden states for ImageAdapter.")
+
+        if self.deep_extract:
+            indices = (-2, 3, 7, 13, 20)
+            if any((idx >= 0 and idx >= len(hidden_states)) or
+                   (idx < 0 and len(hidden_states) + idx < 0) for idx in indices):
+                raise ValueError(f"Insufficient hidden states returned: expected indices {indices}, got {len(hidden_states)} layers.")
+            x = torch.concat(tuple(hidden_states[idx] for idx in indices), dim=-1)
+            assert len(x.shape) == 3, f"Expected 3, got {len(x.shape)}"  # batch, tokens, features
+            assert x.shape[-1] == hidden_states[-2].shape[-1] * 5, f"Expected {hidden_states[-2].shape[-1] * 5}, got {x.shape[-1]}"
+        else:
+            idx = -2 if len(hidden_states) >= 2 else -1
+            x = hidden_states[idx]
 
         x = self.ln1(x)
 
@@ -139,9 +156,9 @@ class JoyImageAdapter:
         self.patcher = ModelPatcher(self.image_adapter, load_device=self.load_device,
                                     offload_device=self.offload_device)
 
-    def embedded_image(self, hidden_states):
+    def embedded_image(self, vision_outputs):
         load_models_gpu([self.patcher], force_full_load=True, force_patch_weights=True)
-        embedded_images = self.image_adapter(hidden_states)
+        embedded_images = self.image_adapter(vision_outputs)
         embedded_images.to(self.load_device)
         return embedded_images
 
@@ -166,18 +183,33 @@ class JoyLLM:
             print(f"Loading LLM: {self.model_id}")
             LLM_PATH = download_hg_model(self.model_id, "LLM")
             text_model_path = os.path.join(BASE_MODEL_PATH, "text_model")
-            modify_json_value(os.path.join(text_model_path, "adapter_config.json"), "base_model_name_or_path",
-                              LLM_PATH)
+            adapter_config_path = os.path.join(text_model_path, "adapter_config.json")
+            modify_json_value(adapter_config_path, "base_model_name_or_path", LLM_PATH)
+            peft_config = PeftConfig.from_pretrained(text_model_path)
+            peft_config.base_model_name_or_path = LLM_PATH
             max_retries = 5  # 设置最大重试次数
             retries = 0
             while True:
                 free_vram = get_free_memory()/1024/1024
                 # print(f"现在的显存{retries}:{free_vram}")
                 if free_vram > 6400:
-                    text_model = AutoModelForCausalLM.from_pretrained(text_model_path,
-                                                              device_map=self.load_device,
-                                                              local_files_only=True,
-                                                              trust_remote_code=True, torch_dtype=self.type)
+                    base_model = AutoModelForCausalLM.from_pretrained(
+                        peft_config.base_model_name_or_path,
+                        device_map=self.load_device,
+                        local_files_only=True,
+                        trust_remote_code=True,
+                        torch_dtype=self.type,
+                    )
+                    # Manually wrap the base model with PEFT to avoid relying on the transformers/peft
+                    # integration that currently mismatches the installed peft version.
+                    text_model = PeftModel.from_pretrained(
+                        base_model,
+                        text_model_path,
+                        config=peft_config,
+                        is_trainable=False,
+                        local_files_only=True,
+                        device_map=self.load_device,
+                    )
                     text_model.eval()
                     self.text_model = text_model
                     break
@@ -185,11 +217,22 @@ class JoyLLM:
                     clear_cache()
                     retries += 1
                     if retries > max_retries:
-                        text_model = AutoModelForCausalLM.from_pretrained(text_model_path,
-                                                                          device_map=self.load_device,
-                                                                          local_files_only=True,
-                                                                          trust_remote_code=True,
-                                                                          torch_dtype=self.type)
+                        base_model = AutoModelForCausalLM.from_pretrained(
+                            peft_config.base_model_name_or_path,
+                            device_map=self.load_device,
+                            local_files_only=True,
+                            trust_remote_code=True,
+                            torch_dtype=self.type,
+                        )
+                        # Same manual PEFT wrapping as above for compatibility.
+                        text_model = PeftModel.from_pretrained(
+                            base_model,
+                            text_model_path,
+                            config=peft_config,
+                            is_trainable=False,
+                            local_files_only=True,
+                            device_map=self.load_device,
+                        )
                         text_model.eval()
                         self.text_model = text_model
                         break
@@ -339,7 +382,7 @@ class Joy_caption_two:
         # This results in Batch x Image Tokens x Features
         with torch.amp.autocast_mode.autocast('cuda', enabled=True):
             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
 
         if low_vram:
             pixel_values.to(joy_two_pipeline.offload_device)
@@ -382,7 +425,8 @@ class Joy_caption_two:
 
         text_model = joy_two_pipeline.llm.load_llm_model()
         # Embed the tokens
-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        input_embeddings = text_model.get_input_embeddings()
+        convo_embeds = input_embeddings(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
 
         # Construct the input
         input_embeds = torch.cat([
@@ -502,7 +546,7 @@ class Joy_caption_two_advanced:
         # This results in Batch x Image Tokens x Features
         with torch.amp.autocast_mode.autocast('cuda', enabled=True):
             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
 
         if low_vram:
             pixel_values.to(joy_two_pipeline.offload_device)
@@ -545,7 +589,8 @@ class Joy_caption_two_advanced:
 
         text_model = joy_two_pipeline.llm.load_llm_model()
         # Embed the tokens
-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        input_embeddings = text_model.get_input_embeddings()
+        convo_embeds = input_embeddings(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
         # Construct the input
         input_embeds = torch.cat([
             convo_embeds[:, :preamble_len],  # Part before the prompt
@@ -617,7 +662,7 @@ class Batch_joy_caption_two:
         # This results in Batch x Image Tokens x Features
         with torch.amp.autocast_mode.autocast('cuda', enabled=True):
             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
 
         if low_vram:
             pixel_values.to(joy_two_pipeline.offload_device)
@@ -659,7 +704,8 @@ class Batch_joy_caption_two:
 
         text_model = joy_two_pipeline.llm.load_llm_model()
         # Embed the tokens
-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        input_embeddings = text_model.get_input_embeddings()
+        convo_embeds = input_embeddings(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
         # Construct the input
         input_embeds = torch.cat([
             convo_embeds[:, :preamble_len],  # Part before the prompt
@@ -815,7 +861,7 @@ class Batch_joy_caption_two_advanced:
         # This results in Batch x Image Tokens x Features
         with torch.amp.autocast_mode.autocast('cuda', enabled=True):
             vision_outputs = joy_two_pipeline.clip_model.encode_image(pixel_values)
-            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs.hidden_states)
+            embedded_images = joy_two_pipeline.image_adapter.embedded_image(vision_outputs)
 
         if low_vram:
             pixel_values.to(joy_two_pipeline.offload_device)
@@ -857,7 +903,8 @@ class Batch_joy_caption_two_advanced:
 
         text_model = joy_two_pipeline.llm.load_llm_model()
         # Embed the tokens
-        convo_embeds = text_model.model.embed_tokens(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
+        input_embeddings = text_model.get_input_embeddings()
+        convo_embeds = input_embeddings(convo_tokens.unsqueeze(0).to(joy_two_pipeline.load_device))
         # Construct the input
         input_embeds = torch.cat([
             convo_embeds[:, :preamble_len],  # Part before the prompt
